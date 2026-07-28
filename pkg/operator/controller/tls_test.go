@@ -140,6 +140,164 @@ func TestTLSConfigFromProfile(t *testing.T) {
 	})
 }
 
+func TestMetricsTLSOptsFromAPIServer(t *testing.T) {
+	tests := []struct {
+		name            string
+		apiServer       *configv1.APIServer
+		wantNil         bool
+		wantErr         bool
+		expectedProfile *configv1.TLSProfileSpec
+	}{
+		{
+			name:      "nil APIServer returns nil",
+			apiServer: nil,
+			wantNil:   true,
+		},
+		{
+			name: "NoOpinion (empty string) returns nil",
+			apiServer: &configv1.APIServer{
+				Spec: configv1.APIServerSpec{
+					TLSAdherence: configv1.TLSAdherencePolicyNoOpinion,
+				},
+			},
+			wantNil: true,
+		},
+		{
+			name: "LegacyAdheringComponentsOnly returns nil",
+			apiServer: &configv1.APIServer{
+				Spec: configv1.APIServerSpec{
+					TLSAdherence: configv1.TLSAdherencePolicyLegacyAdheringComponentsOnly,
+				},
+			},
+			wantNil: true,
+		},
+		{
+			name: "StrictAllComponents returns TLS mutators",
+			apiServer: &configv1.APIServer{
+				Spec: configv1.APIServerSpec{
+					TLSAdherence: configv1.TLSAdherencePolicyStrictAllComponents,
+				},
+			},
+			wantNil: false,
+		},
+		{
+			name: "unknown value returns TLS mutators (defaults to Strict)",
+			apiServer: &configv1.APIServer{
+				Spec: configv1.APIServerSpec{
+					TLSAdherence: "FuturePolicy",
+					TLSSecurityProfile: &configv1.TLSSecurityProfile{
+						Type: configv1.TLSProfileOldType,
+					},
+				},
+			},
+			wantNil:         false,
+			expectedProfile: configv1.TLSProfiles[configv1.TLSProfileOldType],
+		},
+		{
+			name: "StrictAllComponents with nil TLSSecurityProfile uses Intermediate defaults",
+			apiServer: &configv1.APIServer{
+				Spec: configv1.APIServerSpec{
+					TLSAdherence:       configv1.TLSAdherencePolicyStrictAllComponents,
+					TLSSecurityProfile: nil,
+				},
+			},
+			wantNil:         false,
+			expectedProfile: configv1.TLSProfiles[configv1.TLSProfileIntermediateType],
+		},
+		{
+			name: "StrictAllComponents with explicit profile applies it",
+			apiServer: &configv1.APIServer{
+				Spec: configv1.APIServerSpec{
+					TLSAdherence: configv1.TLSAdherencePolicyStrictAllComponents,
+					TLSSecurityProfile: &configv1.TLSSecurityProfile{
+						Type: configv1.TLSProfileOldType,
+					},
+				},
+			},
+			wantNil:         false,
+			expectedProfile: configv1.TLSProfiles[configv1.TLSProfileOldType],
+		},
+		{
+			name: "StrictAllComponents with Custom profile including Groups",
+			apiServer: &configv1.APIServer{
+				Spec: configv1.APIServerSpec{
+					TLSAdherence: configv1.TLSAdherencePolicyStrictAllComponents,
+					TLSSecurityProfile: &configv1.TLSSecurityProfile{
+						Type: configv1.TLSProfileCustomType,
+						Custom: &configv1.CustomTLSProfile{
+							TLSProfileSpec: configv1.TLSProfileSpec{
+								Ciphers:       []string{"ECDHE-RSA-AES256-GCM-SHA384"},
+								MinTLSVersion: configv1.VersionTLS12,
+								Groups: []configv1.TLSGroup{
+									configv1.TLSGroupX25519,
+									configv1.TLSGroupSecP256r1,
+								},
+							},
+						},
+					},
+				},
+			},
+			wantNil: false,
+			expectedProfile: &configv1.TLSProfileSpec{
+				Ciphers:       []string{"ECDHE-RSA-AES256-GCM-SHA384"},
+				MinTLSVersion: configv1.VersionTLS12,
+				Groups: []configv1.TLSGroup{
+					configv1.TLSGroupX25519,
+					configv1.TLSGroupSecP256r1,
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts, err := MetricsTLSOptsFromAPIServer(tt.apiServer)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("MetricsTLSOptsFromAPIServer() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantNil && opts != nil {
+				t.Errorf("expected nil opts, got %v", opts)
+			}
+			if !tt.wantNil && opts == nil {
+				t.Error("expected non-nil opts, got nil")
+			}
+			if !tt.wantNil && opts != nil {
+				cfg := &tls.Config{}
+				opts[0](cfg)
+				if cfg.MinVersion == 0 {
+					t.Error("expected MinVersion to be set by mutator")
+				}
+				if tt.expectedProfile != nil {
+					expectedCfg, err := TLSConfigFromProfile(tt.expectedProfile)
+					if err != nil {
+						t.Fatalf("failed to build expected config: %v", err)
+					}
+					if cfg.MinVersion != expectedCfg.MinVersion {
+						t.Errorf("MinVersion: got %d, want %d", cfg.MinVersion, expectedCfg.MinVersion)
+					}
+					if len(cfg.CipherSuites) != len(expectedCfg.CipherSuites) {
+						t.Errorf("CipherSuites count: got %d, want %d", len(cfg.CipherSuites), len(expectedCfg.CipherSuites))
+					} else {
+						for i := range expectedCfg.CipherSuites {
+							if cfg.CipherSuites[i] != expectedCfg.CipherSuites[i] {
+								t.Errorf("CipherSuites[%d]: got %d, want %d", i, cfg.CipherSuites[i], expectedCfg.CipherSuites[i])
+							}
+						}
+					}
+					if len(cfg.CurvePreferences) != len(expectedCfg.CurvePreferences) {
+						t.Errorf("CurvePreferences count: got %d, want %d", len(cfg.CurvePreferences), len(expectedCfg.CurvePreferences))
+					} else {
+						for i := range expectedCfg.CurvePreferences {
+							if cfg.CurvePreferences[i] != expectedCfg.CurvePreferences[i] {
+								t.Errorf("CurvePreferences[%d]: got %v, want %v", i, cfg.CurvePreferences[i], expectedCfg.CurvePreferences[i])
+							}
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestTLSProfileSpecForSecurityProfile(t *testing.T) {
 	t.Run("nil profile defaults to Intermediate", func(t *testing.T) {
 		spec := TLSProfileSpecForSecurityProfile(nil)
