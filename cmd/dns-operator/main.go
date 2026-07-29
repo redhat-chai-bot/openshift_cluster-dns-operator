@@ -5,8 +5,8 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+	"time"
 
-	configv1 "github.com/openshift/api/config/v1"
 	configclient "github.com/openshift/client-go/config/clientset/versioned"
 	operatorcontroller "github.com/openshift/cluster-dns-operator/pkg/operator/controller"
 
@@ -17,6 +17,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -61,35 +62,65 @@ func main() {
 		logrus.Fatalf("failed to get kube config: %v", err)
 	}
 
-	// Build TLS options for the operator metrics server from the
-	// cluster-wide TLS security profile when secure serving is enabled.
+	// Build TLS options for the operator metrics server, gated on the
+	// cluster's tlsAdherence policy.  Under LegacyAdheringComponentsOnly
+	// (the default) no cluster TLS profile is applied because operator
+	// metrics is a newly adhering surface.  Under StrictAllComponents the
+	// cluster TLS profile is applied.
 	// NOTE: the TLS profile is read once at startup; runtime changes to
-	// APIServer.spec.tlsSecurityProfile require an operator restart.
+	// APIServer require an operator restart.
 	var metricsTLSOpts []func(*tls.Config)
 	if *metricsCertDir != "" {
 		cfgClient, err := configclient.NewForConfig(kubeConfig)
 		if err != nil {
 			logrus.Fatalf("failed to create config client: %v", err)
 		}
-		apiServer, err := cfgClient.ConfigV1().APIServers().Get(context.TODO(), "cluster", metav1.GetOptions{})
-		var tlsSecurityProfile *configv1.TLSSecurityProfile
-		if err != nil {
-			logrus.Warningf("failed to get apiserver config, using Intermediate TLS profile: %v", err)
-		} else {
-			tlsSecurityProfile = apiServer.Spec.TLSSecurityProfile
+		// Retry fetching the APIServer config with exponential backoff
+		// (2s, 4s, 8s) because the API server may be temporarily
+		// unreachable during cluster bootstrap or upgrades.
+		backoff := wait.Backoff{
+			Duration: 2 * time.Second,
+			Factor:   2,
+			Steps:    3,
 		}
-		profileSpec := operatorcontroller.TLSProfileSpecForSecurityProfile(tlsSecurityProfile)
-		tlsCfg, err := operatorcontroller.TLSConfigFromProfile(profileSpec)
-		if err != nil {
-			logrus.Fatalf("failed to build TLS config from profile: %v", err)
-		}
-		metricsTLSOpts = append(metricsTLSOpts, func(cfg *tls.Config) {
-			cfg.CipherSuites = tlsCfg.CipherSuites
-			cfg.MinVersion = tlsCfg.MinVersion
-			if len(tlsCfg.CurvePreferences) > 0 {
-				cfg.CurvePreferences = tlsCfg.CurvePreferences
+		var lastErr error
+		err = wait.ExponentialBackoff(backoff, func() (bool, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			apiServer, getErr := cfgClient.ConfigV1().APIServers().Get(ctx, "cluster", metav1.GetOptions{})
+			if getErr != nil {
+				logrus.Warningf("failed to get apiserver config (will retry): %v", getErr)
+				lastErr = getErr
+				return false, nil
 			}
+			metricsTLSOpts, lastErr = operatorcontroller.MetricsTLSOptsFromAPIServer(apiServer)
+			if lastErr != nil {
+				return false, lastErr
+			}
+			return true, nil
 		})
+		// If all retries were exhausted, fall back to the Intermediate
+		// TLS profile so the operator can still start with secure defaults.
+		// A non-transient error from MetricsTLSOptsFromAPIServer is fatal.
+		if err != nil {
+			if wait.Interrupted(err) {
+				logrus.Warningf("failed to get apiserver config after retries, falling back to Intermediate TLS profile for operator metrics: %v", lastErr)
+			} else {
+				logrus.Fatalf("failed to build TLS options from apiserver config: %v", err)
+			}
+			profileSpec := operatorcontroller.TLSProfileSpecForSecurityProfile(nil)
+			tlsCfg, tlsErr := operatorcontroller.TLSConfigFromProfile(profileSpec)
+			if tlsErr != nil {
+				logrus.Fatalf("failed to build TLS config from Intermediate profile: %v", tlsErr)
+			}
+			metricsTLSOpts = append(metricsTLSOpts, func(cfg *tls.Config) {
+				cfg.CipherSuites = tlsCfg.CipherSuites
+				cfg.MinVersion = tlsCfg.MinVersion
+				if len(tlsCfg.CurvePreferences) > 0 {
+					cfg.CurvePreferences = tlsCfg.CurvePreferences
+				}
+			})
+		}
 	}
 
 	operatorConfig := operatorconfig.Config{

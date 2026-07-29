@@ -75,6 +75,48 @@ func TLSConfigFromProfile(spec *configv1.TLSProfileSpec) (*tls.Config, error) {
 	return crypto.SecureTLSConfig(cfg), nil
 }
 
+// MetricsTLSOptsFromAPIServer returns TLS configuration mutators for the
+// operator metrics server, gated on the cluster's tlsAdherence policy.
+// When ShouldHonorClusterTLSProfile returns false (Legacy/NoOpinion), no
+// mutators are returned and the caller should use default TLS settings.
+func MetricsTLSOptsFromAPIServer(apiServer *configv1.APIServer) ([]func(*tls.Config), error) {
+	if apiServer == nil {
+		return nil, nil
+	}
+
+	adherence := apiServer.Spec.TLSAdherence
+
+	switch adherence {
+	case configv1.TLSAdherencePolicyNoOpinion,
+		configv1.TLSAdherencePolicyLegacyAdheringComponentsOnly,
+		configv1.TLSAdherencePolicyStrictAllComponents:
+	default:
+		logrus.Warningf("MetricsTLSOptsFromAPIServer: unrecognized tlsAdherence value %q, defaulting to Strict behavior (honoring cluster TLS profile)", adherence)
+	}
+
+	if !crypto.ShouldHonorClusterTLSProfile(adherence) {
+		logrus.Infof("MetricsTLSOptsFromAPIServer: tlsAdherence=%q, not applying cluster TLS profile to operator metrics", adherence)
+		return nil, nil
+	}
+
+	logrus.Infof("MetricsTLSOptsFromAPIServer: tlsAdherence=%q, applying cluster TLS security profile to operator metrics", adherence)
+
+	profileSpec := TLSProfileSpecForSecurityProfile(apiServer.Spec.TLSSecurityProfile)
+	tlsCfg, err := TLSConfigFromProfile(profileSpec)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build TLS config from cluster profile: %w", err)
+	}
+
+	mutator := func(cfg *tls.Config) {
+		cfg.CipherSuites = tlsCfg.CipherSuites
+		cfg.MinVersion = tlsCfg.MinVersion
+		if len(tlsCfg.CurvePreferences) > 0 {
+			cfg.CurvePreferences = tlsCfg.CurvePreferences
+		}
+	}
+	return []func(*tls.Config){mutator}, nil
+}
+
 // TLSProfileSpecForSecurityProfile returns a TLSProfileSpec based on the
 // provided security profile, or the Intermediate profile if an unknown
 // profile type is provided or the profile is nil.
